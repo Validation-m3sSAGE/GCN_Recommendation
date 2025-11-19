@@ -1,3 +1,6 @@
 dataset/
 script/
+checkpoints_old/
+checkpoints_old2/
+*.jsonl
 __pycache__
