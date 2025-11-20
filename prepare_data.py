@@ -1,8 +1,9 @@
-# prepare_data.py
 import json
 import pandas as pd
+import numpy as np
 from tqdm import tqdm
 import os
+import argparse
 
 def prepare_and_save_data(config):
     """
@@ -18,15 +19,20 @@ def prepare_and_save_data(config):
     # --- 1. 加载和过滤评论数据 ---
     print(f"Step 1: Loading and filtering reviews from '{config['review_file']}'...")
     reviews = []
-    # 注意：这里我们完整加载评论文件来构建最准确的图
-    # 如果内存不足，可以考虑分块处理，但会更复杂
-    with open(config['review_file'], 'r') as f:
-        for line in tqdm(f, desc="Loading Reviews"):
-            reviews.append(json.loads(line.strip()))
     
+    # 如果 review_file 很大，这里可以考虑分块加载或限制加载行数进行快速测试
+    # with open(config['review_file'], 'r') as f:
+    #     for i, line in enumerate(tqdm(f, desc="Loading Reviews")):
+    #         if i >= 5000000: # 限制加载行数进行调试
+    #             break
+    #         reviews.append(json.loads(line.strip()))
+
+    with open(config['review_file'], 'r') as f:
+        reviews = [json.loads(line.strip()) for line in tqdm(f, desc="Loading Reviews")]
+
     df = pd.DataFrame(reviews)[['user_id', 'parent_asin', 'rating']]
     df.rename(columns={'parent_asin': 'item_id'}, inplace=True)
-    df.dropna(inplace=True) # 删除缺失值
+    df.dropna(inplace=True)
     print(f"Loaded {len(df)} interactions initially.")
 
     # K-core filtering
@@ -35,7 +41,8 @@ def prepare_and_save_data(config):
         item_counts = df['item_id'].value_counts()
         weak_users = user_counts[user_counts < config['min_interactions']].index
         weak_items = item_counts[item_counts < config['min_interactions']].index
-        if len(weak_users) == 0 and len(weak_items) == 0: break
+        if len(weak_users) == 0 and len(weak_items) == 0:
+            break
         df = df[~df['user_id'].isin(weak_users)]
         df = df[~df['item_id'].isin(weak_items)]
     print(f"Filtered to {len(df)} interactions, {df['user_id'].nunique()} users, {df['item_id'].nunique()} items.")
@@ -66,7 +73,6 @@ def prepare_and_save_data(config):
     item_brand_df['item_idx'] = item_brand_df['item_id'].map(item_map)
     item_brand_df['brand_idx'] = item_brand_df['brand'].map(brand_map)
     
-    # 过滤掉映射后可能产生的NaN (如果meta和review不完全匹配)
     item_brand_df.dropna(subset=['item_idx'], inplace=True)
     item_brand_df['item_idx'] = item_brand_df['item_idx'].astype(int)
 
@@ -77,32 +83,39 @@ def prepare_and_save_data(config):
     train_df = df[df['rank_latest'] > 1]
 
     # --- 5. 保存处理好的数据 ---
-    print(f"\nStep 5: Saving processed data to '{config['output_dir']}'...")
-    if not os.path.exists(config['output_dir']):
-        os.makedirs(config['output_dir'])
+    output_dir = os.path.join(config['output_base_dir'], f"processed_data_{config['min_interactions']}")
+    print(f"\nStep 5: Saving processed data to '{output_dir}'...")
+    os.makedirs(output_dir, exist_ok=True)
 
-    train_df[['user_idx', 'item_idx']].to_parquet(os.path.join(config['output_dir'], 'train.parquet'), index=False)
-    test_df[['user_idx', 'item_idx']].to_parquet(os.path.join(config['output_dir'], 'test.parquet'), index=False)
-    item_brand_df[['item_idx', 'brand_idx']].to_parquet(os.path.join(config['output_dir'], 'item_brand.parquet'), index=False)
+    train_df[['user_idx', 'item_idx']].to_parquet(os.path.join(output_dir, 'train.parquet'), index=False)
+    test_df[['user_idx', 'item_idx']].to_parquet(os.path.join(output_dir, 'test.parquet'), index=False)
+    item_brand_df[['item_idx', 'brand_idx']].to_parquet(os.path.join(output_dir, 'item_brand.parquet'), index=False)
     
-    # 保存映射和统计信息
     stats = {
         'num_users': len(user_map),
         'num_items': len(item_map),
         'num_brands': len(brand_map)
     }
-    with open(os.path.join(config['output_dir'], 'stats.json'), 'w') as f:
+    with open(os.path.join(output_dir, 'stats.json'), 'w') as f:
         json.dump(stats, f)
 
     print("\n--- Data Preparation Finished ---")
+    print(f"Data for {config['min_interactions']}-core filtering saved in '{output_dir}'")
 
 
 if __name__ == '__main__':
-    # 确保已安装: pip install pandas pyarrow
+    parser = argparse.ArgumentParser(description="Preprocess Amazon review data.")
+    parser.add_argument('--core', type=int, default=5, help="K-core filtering threshold.")
+    parser.add_argument('--review_path', type=str, default='dataset/amazon_books/Books.jsonl', help="Path to the review data file.")
+    parser.add_argument('--meta_path', type=str, default='dataset/amazon_books/meta_Books.jsonl', help="Path to the metadata file.")
+    parser.add_argument('--output_dir', type=str, default='dataset/amazon_books/', help="Base directory for output.")
+    args = parser.parse_args()
+    
+    # 确保已安装: pip install pandas pyarrow tqdm
     prep_config = {
-        'review_file': 'dataset/amazon_books/raw_data/Books.jsonl',
-        'metadata_file': 'dataset/amazon_books/raw_data/meta_Books.jsonl',
-        'min_interactions': 1,  # 1-core filtering
-        'output_dir': 'dataset/amazon_books/processed_data' # 输出目录
+        'review_file': args.review_path,
+        'metadata_file': args.meta_path,
+        'min_interactions': args.core,
+        'output_base_dir': args.output_dir
     }
     prepare_and_save_data(prep_config)

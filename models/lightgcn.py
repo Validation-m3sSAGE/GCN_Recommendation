@@ -1,3 +1,5 @@
+# models/lightgcn.py
+
 import torch
 import torch.nn as nn
 
@@ -18,28 +20,27 @@ class LightGCN(nn.Module):
         self.item_embedding = nn.Embedding(num_items, self.embedding_dim)
         self.brand_embedding = nn.Embedding(num_brands, self.embedding_dim)
         
-        # 初始化权重
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_embedding.weight)
         nn.init.xavier_uniform_(self.brand_embedding.weight)
 
     def forward(self, adj_mat):
-        # 拼接所有类型的嵌入
-        ego_embeddings = torch.cat([self.user_embedding.weight, 
-                                    self.item_embedding.weight,
-                                    self.brand_embedding.weight], dim=0)
+        # 初始嵌入
+        user_emb_0 = self.user_embedding.weight
+        item_emb_0 = self.item_embedding.weight
+        brand_emb_0 = self.brand_embedding.weight
+        
+        ego_embeddings = torch.cat([user_emb_0, item_emb_0, brand_emb_0], dim=0)
         all_embeddings = [ego_embeddings]
         
-        # GNN 传播
         for _ in range(self.n_layers):
             ego_embeddings = torch.sparse.mm(adj_mat, ego_embeddings)
             all_embeddings.append(ego_embeddings)
         
-        # 聚合各层嵌入
         final_embeddings = torch.mean(torch.stack(all_embeddings, dim=0), dim=0)
         
-        # 拆分嵌入以获取最终的用户和物品表征
-        final_user_embeddings, final_item_embeddings, _ = torch.split(
+        final_user_emb, final_item_emb, _ = torch.split(
             final_embeddings, [self.num_users, self.num_items, self.num_brands])
         
-        return final_user_embeddings, final_item_embeddings
+        # 返回最终嵌入和初始嵌入，用于修复计算图断裂问题
+        return final_user_emb, final_item_emb, user_emb_0, item_emb_0
