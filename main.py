@@ -51,7 +51,7 @@ class Config:
         self.learning_rate = 0.001
         self.weight_decay = 1e-4
         self.batch_size = 2048
-        self.epochs = 8 # 建议至少训练20个epoch
+        self.epochs = 12 # 建议至少训练20个epoch
         self.top_k = 20
         self.checkpoint_dir = 'checkpoints'
         self.results_dir = 'results'
