@@ -51,7 +51,7 @@ class Config:
         self.learning_rate = 0.001
         self.weight_decay = 1e-4
         self.batch_size = 2048
-        self.epochs = 12 # 建议至少训练20个epoch
+        self.epochs = 6 # 建议至少训练20个epoch
         self.top_k = 20
         self.checkpoint_dir = 'checkpoints'
         self.results_dir = 'results'
@@ -206,7 +206,7 @@ def evaluate(model, test_data, train_data, k, device, batch_size=1024):
                     ndcgs.append(0)
     return np.mean(recalls), np.mean(ndcgs)
 
-def train(config, model_class, model_name):
+def train(config, model_class, model_name, model_path):
     logger = Logger(config.results_dir, model_name)
     train_df, test_df, num_users, num_items, num_brands, norm_adj_tensor = \
         load_preprocessed_data(config.processed_data_dir, config.device)
@@ -214,6 +214,8 @@ def train(config, model_class, model_name):
     
     train_loader = DataLoader(BPRDataset(train_df, num_items), batch_size=config.batch_size, shuffle=True, num_workers=4)
     model = model_class(num_users, num_items, num_brands, config).to(config.device)
+    if model_path != None:
+        model.load_state_dict(torch.load(model_path, map_location=config.device))
     print(f"Initialized model: {model.__class__.__name__}")
     optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
     
@@ -298,7 +300,8 @@ if __name__ == '__main__':
     config.best_model_name = f'best_{args.model_name.lower()}_core{args.core}.pth'
 
     if args.mode == 'train':
-        train(config, ModelClass, args.model_name) 
+        model_to_train = args.model_path if args.model_path else None
+        train(config, ModelClass, args.model_name, model_to_train) 
     elif args.mode == 'test':
         model_to_test = args.model_path if args.model_path else os.path.join(config.checkpoint_dir, config.best_model_name)
         test(config, ModelClass, model_to_test)
