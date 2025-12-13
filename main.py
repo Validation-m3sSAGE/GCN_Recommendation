@@ -51,10 +51,10 @@ class Config:
         self.learning_rate = 0.001
         self.weight_decay = 1e-4
         self.batch_size = 2048
-        self.epochs = 6 # 建议至少训练20个epoch
+        self.epochs = 40 # 建议至少训练20个epoch
         self.top_k = 20
-        self.checkpoint_dir = 'checkpoints'
-        self.results_dir = 'results'
+        self.checkpoint_dir = 'checkpoints_all/checkpoints'
+        self.results_dir = 'results_all/results'
         self.best_model_name = 'best_model.pth'
 
 class Logger:
