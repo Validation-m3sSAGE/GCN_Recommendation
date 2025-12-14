@@ -14,37 +14,20 @@ import importlib
 import matplotlib.pyplot as plt
 import subprocess
 
-# --- GPU & Model Loading (保持不变) ---
+# --- GPU & Model Loading ---
 def set_best_gpu():
-    """
-    自动选择负载最低的单个GPU。
-    负载标准：优先考虑空闲显存，其次考虑GPU利用率。
-    """
     try:
-        # 查询 GPU 索引、空闲显存、GPU利用率
         result = subprocess.check_output(
             ['nvidia-smi', '--query-gpu=index,memory.free,utilization.gpu', '--format=csv,nounits,noheader'],
             encoding='utf-8')
+        gpus = [{'id': int(index), 'free_mem': int(free_memory), 'util': int(gpu_util)} 
+                for index, free_memory, gpu_util in (line.split(',') for line in result.strip().split('\n'))]
         
-        gpus = []
-        for line in result.strip().split('\n'):
-            index, free_memory, gpu_util = map(int, line.split(','))
-            gpus.append({'id': index, 'free_mem': free_memory, 'util': gpu_util})
-        
-        if not gpus:
-            print("No GPUs found.")
-            return
-
-        # 定义评分标准：高空闲显存和低利用率的GPU得分更高
-        # 权重可以调整，这里给显存的权重是利用率的2倍
         for gpu in gpus:
             gpu['score'] = gpu['free_mem'] - 2 * gpu['util']
-
-        # 按分数降序排序
-        gpus.sort(key=lambda x: x['score'], reverse=True)
         
-        best_gpu = gpus[0]
-        best_gpu_id = best_gpu['id']
+        gpus.sort(key=lambda x: x['score'], reverse=True)
+        best_gpu_id = gpus[0]['id']
         
         print("--- GPU Status ---")
         for gpu in gpus:
@@ -53,7 +36,6 @@ def set_best_gpu():
         
         print(f"Automatically selecting the best single GPU: {best_gpu_id}")
         os.environ["CUDA_VISIBLE_DEVICES"] = str(best_gpu_id)
-
     except Exception as e:
         print(f"Could not automatically select GPU: {e}. Using default GPU settings.")
 
@@ -233,6 +215,11 @@ def load_preprocessed_data(data_dir, device, use_brand=True, debug=False):
     user_indices = train_df['user_idx'].values
     item_indices_for_user = train_df['item_idx'].values + item_offset
     
+    # --- START DEBUGGING BLOCK ---
+    print("\n" + "="*20 + " GRAPH CONSTRUCTION DEBUG " + "="*20)
+    print(f"Mode: {'With Brand' if use_brand else 'No Brand'}")
+    print(f"Total Users in train_df: {len(user_indices)}")
+    
     if use_brand:
         print("Building graph with Brand information.")
         item_indices_for_brand = item_brand_df['item_idx'].values + item_offset
@@ -244,12 +231,34 @@ def load_preprocessed_data(data_dir, device, use_brand=True, debug=False):
         all_rows = np.concatenate([user_indices, item_indices_for_user])
         all_cols = np.concatenate([item_indices_for_user, user_indices])
     
-    # --- FIX: Move all_data definition out of the else block ---
+    # 定义 all_data
     all_data = np.ones(all_rows.shape[0], dtype=np.float32)
-    # --- END FIX ---
+
+    # --- FINAL DIAGNOSIS BLOCK ---
+    expected_edges = 0
+    if use_brand:
+        expected_edges = (len(user_indices) + len(item_brand_df['item_idx'].values)) * 2
+    else:
+        expected_edges = len(user_indices) * 2
+        
+    print(f"DEBUG: expected_edges = {expected_edges}")
+    print(f"DEBUG: all_rows.shape[0] = {all_rows.shape[0]}")
+    print(f"DEBUG: all_data.shape[0] = {all_data.shape[0]}")
+    
+    # 强制断言，如果长度不匹配，程序会在这里崩溃
+    assert all_rows.shape[0] == expected_edges, "Error: Mismatch in row coordinates count!"
+    assert all_data.shape[0] == expected_edges, "Error: Mismatch in data count!"
+    # --- END DIAGNOSIS BLOCK ---
 
     adj_mat = sp.coo_matrix((all_data, (all_rows, all_cols)), shape=(num_nodes, num_nodes))
-    print("Heterogeneous adjacency matrix created.")
+    
+    # 检查稀疏矩阵的非零元素数量是否符合预期
+    # coo_matrix 会合并重复项，所以 nnz 可能会略小于 expected_edges，但差距不应过大
+    if abs(adj_mat.nnz - expected_edges) > 10: # 允许少量重复
+         print(f"WARNING: Significant difference between expected edges ({expected_edges}) and matrix nnz ({adj_mat.nnz}).")
+
+    print(f"Final Adjacency Matrix non-zero elements (adj_mat.nnz): {adj_mat.nnz}")
+    print("="*60 + "\n")
     
     rowsum = np.array(adj_mat.sum(axis=1))
     with np.errstate(divide='ignore'):
@@ -298,15 +307,15 @@ def evaluate(model, val_or_test_data, train_data, norm_adj_tensor, k, device, ba
 
     with torch.no_grad():
         # GNN传播在评估开始时只进行一次
+        # FIX: Use the explicitly passed norm_adj_tensor
         all_user_emb, all_item_emb, _, _ = model(norm_adj_tensor)
         
         for i in tqdm(range(0, len(test_users), batch_size), desc="Evaluating"):
             batch_users = test_users[i: i + batch_size]
             batch_users_tensor = torch.LongTensor(batch_users).to(device)
             
-            # 评分计算
             batch_scores = torch.matmul(all_user_emb[batch_users_tensor], all_item_emb.T)
-
+            
             for j, user_idx in enumerate(batch_users):
                 if user_idx in train_user_items:
                     batch_scores[j, train_user_items[user_idx]] = -1e10
@@ -330,21 +339,10 @@ def evaluate(model, val_or_test_data, train_data, norm_adj_tensor, k, device, ba
 def train(config, model_class, model_name, use_brand):
     logger = Logger(config.results_dir, f"{model_name}_{'brand' if use_brand else 'no_brand'}")
     
-    # 在 train 函数内部加载所有需要的数据
-    all_train_df = pd.read_parquet(os.path.join(config.processed_data_dir, 'train.parquet'))
-    test_df_for_filter = pd.read_parquet(os.path.join(config.processed_data_dir, 'test.parquet'))
-
-    # 动态划分验证集
-    all_train_df['rank'] = all_train_df.groupby('user_idx')['user_idx'].rank(method='first', ascending=False)
-    val_df = all_train_df[all_train_df['rank'] == 1]
-    train_df = all_train_df[all_train_df['rank'] > 1]
-    
-    # 评估时需要完整的训练交互（包括用于验证的）来进行过滤
-    full_train_df_for_filter = pd.concat([train_df, val_df])
-    
-    _, _, _, num_users, num_items, num_brands, norm_adj_tensor = \
+    # 加载所有数据，包括用于最终测试过滤的全量训练数据
+    train_df, val_df, test_df, num_users, num_items, num_brands, norm_adj_tensor = \
         load_preprocessed_data(config.processed_data_dir, config.device, use_brand=use_brand, debug=config.debug)
-        
+    
     train_loader = DataLoader(BPRDataset(train_df, num_items), 
                               batch_size=config.batch_size, shuffle=True, 
                               num_workers=config.num_workers, pin_memory=True)
@@ -391,7 +389,7 @@ def train(config, model_class, model_name, use_brand):
         
         if epoch % config.val_interval == 0:
             print("Evaluating on VALIDATION set...")
-            # 直接传递 model 和 norm_adj_tensor
+            # FIX: Explicitly pass norm_adj_tensor to the evaluate function
             recall, ndcg = evaluate(model, val_df, train_df, norm_adj_tensor, config.top_k, config.device)
             print(f"Epoch {epoch} | Val Recall@{config.top_k}: {recall:.4f}, Val NDCG@{config.top_k}: {ndcg:.4f}")
             logger.log_epoch_metrics(epoch=epoch, avg_loss=avg_loss, recall=recall, ndcg=ndcg)
@@ -406,40 +404,23 @@ def train(config, model_class, model_name, use_brand):
     logger.save(total_epochs=config.epochs)
 
 def test(config, model_class, model_path, use_brand):
-    """加载已训练模型并在最终的测试集上进行评估"""
     print("--- Starting Testing Mode ---")
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model checkpoint not found at '{model_path}'")
     
-    # 1. 加载所有需要的数据集
+    # 加载所有数据集
     train_df, val_df, test_df, num_users, num_items, num_brands, norm_adj_tensor = \
         load_preprocessed_data(config.processed_data_dir, config.device, use_brand=use_brand, debug=config.debug)
         
-    # 2. 初始化并加载模型
     model = model_class(num_users, num_items, num_brands, config).to(config.device)
-    try:
-        model.load_state_dict(torch.load(model_path, map_location=config.device))
-    except RuntimeError as e:
-        print(f"Error loading state_dict: {e}")
-        print("This might happen if you are loading a model saved with DataParallel on a single GPU.")
-        print("Attempting to load by stripping 'module.' prefix...")
-        from collections import OrderedDict
-        state_dict = torch.load(model_path, map_location=config.device)
-        new_state_dict = OrderedDict()
-        for k, v in state_dict.items():
-            name = k[7:] if k.startswith('module.') else k
-            new_state_dict[name] = v
-        model.load_state_dict(new_state_dict)
-
+    model.load_state_dict(torch.load(model_path, map_location=config.device))
     print(f"Model loaded from '{model_path}'")
 
-    # 3. 评估模型
     print("Evaluating on the TEST set...")
-    # --- FIX: 构建用于过滤的完整训练集 ---
     # 在测试时，过滤集是 train_df + val_df
     full_train_df_for_filter = pd.concat([train_df, val_df])
-    # --- END FIX ---
     
+    # FIX: Explicitly pass norm_adj_tensor to the evaluate function
     recall, ndcg = evaluate(model, test_df, full_train_df_for_filter, norm_adj_tensor, config.top_k, config.device)
     
     print("\n--- Final Test Results ---")
@@ -454,8 +435,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run GNN-based recommendation models.")
     parser.add_argument('mode', choices=['train', 'test'], help="Mode: 'train' or 'test'")
     parser.add_argument('--model_name', type=str, default='LightGCN', help="The name of the model class.")
-    parser.add_argument('--core', type=int, default=20, help="K-core filtering threshold for data.")
-    parser.add_argument('--epochs', type=int, default=150, help="Number of training epochs.")
+    parser.add_argument('--core', type=int, default=10, help="K-core filtering threshold for data.")
+    parser.add_argument('--epochs', type=int, default=100, help="Number of training epochs.")
     parser.add_argument('--model_path', type=str, help="Path to checkpoint for testing.")
     parser.add_argument('--no_brand', action='store_true', help="Run ablation study without brand info.")
     # --num_gpus 参数不再需要，可以移除
