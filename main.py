@@ -169,100 +169,165 @@ class Logger:
 
 # --- Data Loading (MODIFIED for Debug Mode) ---
 def load_preprocessed_data(data_dir, device, use_brand=True, debug=False):
-    print("Step 1: Loading and preparing data...")
+    """
+    加载预处理数据，并补充异构图核心统计信息
+    :param data_dir: 数据目录
+    :param device: 设备（cuda/cpu）
+    :param use_brand: 是否使用品牌节点
+    :param debug: 是否调试模式（小样本）
+    :return: 训练/验证/测试集 + 节点数 + 归一化邻接矩阵 + 物品-品牌df + 统计信息dict
+    """
+    print("="*80)
+    print("Step 1: Loading and preparing data (with graph structure stats)")
+    print("="*80)
+    
+    # 1. 加载基础数据
     stats_path = os.path.join(data_dir, 'stats.json')
     if not os.path.exists(stats_path):
-        raise FileNotFoundError(f"Data not found in '{data_dir}'. Please run 'prepare_data.py'.")
+        raise FileNotFoundError(f"Stats file not found in '{data_dir}'. Please run 'prepare_data.py' first.")
 
-    data_fraction = 0.01 if debug else 1.0 
-    
-    print("Loading and splitting train/validation sets at runtime...")
+    # 加载交互数据和物品-品牌映射
     all_train_df = pd.read_parquet(os.path.join(data_dir, 'train.parquet'))
     test_df = pd.read_parquet(os.path.join(data_dir, 'test.parquet'))
     item_brand_df = pd.read_parquet(os.path.join(data_dir, 'item_brand.parquet'))
 
+    # 2. Debug模式下采样小样本
+    data_fraction = 0.01 if debug else 1.0
     if debug:
-        print(f"Debug mode: Using a small fraction ({data_fraction * 100}%) of the data.")
+        print(f"\n[Debug Mode] Using {data_fraction*100}% of the original data")
         unique_users = all_train_df['user_idx'].unique()
-        if len(unique_users) == 0:
-             raise ValueError("No users found after loading data. Check data paths and content.")
-        sample_size = int(len(unique_users) * data_fraction)
-        if sample_size == 0:
-             sample_size = 1 # Ensure at least one user is sampled
+        sample_size = max(1, int(len(unique_users) * data_fraction))  # 至少1个用户
         sample_users = np.random.choice(unique_users, size=sample_size, replace=False)
         all_train_df = all_train_df[all_train_df['user_idx'].isin(sample_users)]
         test_df = test_df[test_df['user_idx'].isin(sample_users)]
 
+    # 3. 划分训练/验证集（按用户最后一次交互为验证集）
     all_train_df['rank'] = all_train_df.groupby('user_idx')['user_idx'].rank(method='first', ascending=False)
-    val_df = all_train_df[all_train_df['rank'] == 1]
-    train_df = all_train_df[all_train_df['rank'] > 1]
+    val_df = all_train_df[all_train_df['rank'] == 1].copy()
+    train_df = all_train_df[all_train_df['rank'] > 1].copy()
     
-    # 确保即使在debug模式下划分后仍有数据
-    if train_df.empty or val_df.empty:
-        print("Warning: train_df or val_df is empty after split. May cause issues in training/evaluation.")
-
-    print(f"Data loaded: {len(train_df)} train, {len(val_df)} validation, {len(test_df)} test interactions.")
-    
+    # 4. 基础统计（核心）
     with open(stats_path, 'r') as f:
-        stats = json.load(f)
-    num_users, num_items, num_brands = stats['num_users'], stats['num_items'], stats['num_brands']
+        base_stats = json.load(f)
+    num_users = base_stats['num_users']
+    num_items = base_stats['num_items']
+    num_brands = base_stats['num_brands']  # 属性（品牌）数
 
-    print("Building adjacency matrix...")
+    # 5. 计算异构图关键统计指标
+    graph_stats = {}
+    
+    # 5.1 基础节点计数
+    graph_stats['num_users'] = num_users
+    graph_stats['num_items'] = num_items
+    graph_stats['num_brands'] = num_brands
+    graph_stats['total_nodes'] = num_users + num_items + num_brands if use_brand else num_users + num_items
+
+    # 5.2 用户-物品交互统计
+    total_interactions = len(train_df)  # 训练集总交互数
+    graph_stats['total_user_item_interactions'] = total_interactions
+    
+    # 每个用户平均交互物品数（均值/中位数/最大值）
+    user_item_count = train_df.groupby('user_idx')['item_idx'].nunique()
+    graph_stats['avg_items_per_user'] = round(user_item_count.mean(), 2)
+    graph_stats['median_items_per_user'] = round(user_item_count.median(), 2)
+    graph_stats['max_items_per_user'] = user_item_count.max()
+    graph_stats['min_items_per_user'] = user_item_count.min()
+
+    # 每个物品平均交互用户数（均值/中位数/最大值）
+    item_user_count = train_df.groupby('item_idx')['user_idx'].nunique()
+    graph_stats['avg_users_per_item'] = round(item_user_count.mean(), 2)
+    graph_stats['median_users_per_item'] = round(item_user_count.median(), 2)
+    graph_stats['max_users_per_item'] = item_user_count.max()
+    graph_stats['min_users_per_item'] = item_user_count.min()
+
+    # 5.3 物品-品牌（属性）关联统计
+    # 每个物品对应品牌数（这里是1，若多属性可调整）
+    item_brand_count = item_brand_df.groupby('item_idx')['brand_idx'].nunique()
+    graph_stats['avg_brands_per_item'] = round(item_brand_count.mean(), 2)
+    graph_stats['median_brands_per_item'] = round(item_brand_count.median(), 2)
+    
+    # 每个品牌对应物品数（均值/中位数/最大值）
+    brand_item_count = item_brand_df.groupby('brand_idx')['item_idx'].nunique()
+    graph_stats['avg_items_per_brand'] = round(brand_item_count.mean(), 2)
+    graph_stats['median_items_per_brand'] = round(brand_item_count.median(), 2)
+    graph_stats['max_items_per_brand'] = brand_item_count.max()
+    graph_stats['min_items_per_brand'] = brand_item_count.min()
+
+    # 5.4 图密度（交互数/总可能交互数，反映稀疏性）
+    max_possible_user_item = num_users * num_items
+    graph_stats['user_item_graph_density'] = round(total_interactions / max_possible_user_item * 100, 6)  # 百分比
+    if use_brand:
+        total_brand_item_edges = len(item_brand_df)
+        max_possible_brand_item = num_brands * num_items
+        graph_stats['brand_item_graph_density'] = round(total_brand_item_edges / max_possible_brand_item * 100, 6)
+
+    # 6. 打印统计信息（清晰格式化）
+    print("\n" + "="*40 + " Graph Structure Statistics " + "="*40)
+    print(f"[Basic Node Count]")
+    print(f"  - Users: {graph_stats['num_users']:,}")
+    print(f"  - Items: {graph_stats['num_items']:,}")
+    print(f"  - Brands (Attributes): {graph_stats['num_brands']:,}")
+    print(f"  - Total Nodes (with brand): {graph_stats['total_nodes']:,}")
+    
+    print(f"\n[User-Item Interaction]")
+    print(f"  - Total Interactions: {graph_stats['total_user_item_interactions']:,}")
+    print(f"  - Avg Items per User: {graph_stats['avg_items_per_user']} (median: {graph_stats['median_items_per_user']})")
+    print(f"  - Avg Users per Item: {graph_stats['avg_users_per_item']} (median: {graph_stats['median_users_per_item']})")
+    print(f"  - User-Item Graph Density: {graph_stats['user_item_graph_density']}% (sparsity: {100-graph_stats['user_item_graph_density']:.6f}%)")
+    
+    print(f"\n[Item-Brand (Attribute) Association]")
+    print(f"  - Avg Brands per Item: {graph_stats['avg_brands_per_item']} (median: {graph_stats['median_brands_per_item']})")
+    print(f"  - Avg Items per Brand: {graph_stats['avg_items_per_brand']} (median: {graph_stats['median_items_per_brand']})")
+    if use_brand:
+        print(f"  - Brand-Item Graph Density: {graph_stats['brand_item_graph_density']}%")
+    print("="*90 + "\n")
+
+    # 7. 构建邻接矩阵（原有逻辑，补充统计）
+    print("Step 2: Building adjacency matrix...")
     item_offset = num_users
     brand_offset = num_users + num_items
-    num_nodes = num_users + num_items + num_brands
     
+    # 确定节点总数
+    num_nodes = num_users + num_items + num_brands  # 无论use_brand是否为True
+    # 移除原有分支：if use_brand: num_nodes = ... else: num_nodes = ...
+
+    # 提取用户-物品边（不变）
     user_indices = train_df['user_idx'].values
     item_indices_for_user = train_df['item_idx'].values + item_offset
     
-    # --- START DEBUGGING BLOCK ---
-    print("\n" + "="*20 + " GRAPH CONSTRUCTION DEBUG " + "="*20)
-    print(f"Mode: {'With Brand' if use_brand else 'No Brand'}")
-    print(f"Total Users in train_df: {len(user_indices)}")
+    # 构建边（仅use_brand=True时添加商品-品牌边，否则只保留用户-物品边）
+    print(f"\n[Adjacency Matrix Info]")
+    print(f"  - Mode: {'With Brand' if use_brand else 'No Brand'}")
+    print(f"  - Train Users Count: {len(np.unique(user_indices)):,}")
+    print(f"  - Train Items Count: {len(np.unique(train_df['item_idx'])):,}")
+    print(f"  - Total Nodes (fixed): {num_nodes:,} (users+items+brands)")
     
     if use_brand:
-        print("Building graph with Brand information.")
+        # 有品牌：添加用户-物品边 + 商品-品牌边
         item_indices_for_brand = item_brand_df['item_idx'].values + item_offset
         brand_indices = item_brand_df['brand_idx'].values + brand_offset
         all_rows = np.concatenate([user_indices, item_indices_for_user, item_indices_for_brand, brand_indices])
         all_cols = np.concatenate([item_indices_for_user, user_indices, brand_indices, item_indices_for_brand])
+        expected_edges = (len(user_indices) + len(item_brand_df)) * 2
     else:
-        print("Building graph WITHOUT Brand information (ablation study).")
+        # 无品牌：仅保留用户-物品边（品牌节点孤立，无任何边）
         all_rows = np.concatenate([user_indices, item_indices_for_user])
         all_cols = np.concatenate([item_indices_for_user, user_indices])
+        expected_edges = len(user_indices) * 2
     
-    # 定义 all_data
     all_data = np.ones(all_rows.shape[0], dtype=np.float32)
 
-    # --- FINAL DIAGNOSIS BLOCK ---
-    expected_edges = 0
-    if use_brand:
-        expected_edges = (len(user_indices) + len(item_brand_df['item_idx'].values)) * 2
-    else:
-        expected_edges = len(user_indices) * 2
-        
-    print(f"DEBUG: expected_edges = {expected_edges}")
-    print(f"DEBUG: all_rows.shape[0] = {all_rows.shape[0]}")
-    print(f"DEBUG: all_data.shape[0] = {all_data.shape[0]}")
-    brand_item_count = item_brand_df['brand_idx'].value_counts()
-    print(f"品牌覆盖商品数的中位数：{brand_item_count.median()}")
-    print(f"品牌覆盖商品数的最大值/最小值：{brand_item_count.max()}/{brand_item_count.min()}")
-    
-    # 强制断言，如果长度不匹配，程序会在这里崩溃
-    assert all_rows.shape[0] == expected_edges, "Error: Mismatch in row coordinates count!"
-    assert all_data.shape[0] == expected_edges, "Error: Mismatch in data count!"
-    # --- END DIAGNOSIS BLOCK ---
+    # 验证边数
+    print(f"  - Expected Edges: {expected_edges:,}")
+    print(f"  - Actual Edges: {all_rows.shape[0]:,}")
+    assert all_rows.shape[0] == expected_edges, f"Edge count mismatch! Expected {expected_edges}, got {all_rows.shape[0]}"
 
+    # 构建稀疏邻接矩阵
     adj_mat = sp.coo_matrix((all_data, (all_rows, all_cols)), shape=(num_nodes, num_nodes))
+    print(f"  - Adjacency Matrix Shape: {adj_mat.shape} (nodes × nodes)")
+    print(f"  - Non-zero Elements: {adj_mat.nnz:,}")
     
-    # 检查稀疏矩阵的非零元素数量是否符合预期
-    # coo_matrix 会合并重复项，所以 nnz 可能会略小于 expected_edges，但差距不应过大
-    if abs(adj_mat.nnz - expected_edges) > 10: # 允许少量重复
-         print(f"WARNING: Significant difference between expected edges ({expected_edges}) and matrix nnz ({adj_mat.nnz}).")
-
-    print(f"Final Adjacency Matrix non-zero elements (adj_mat.nnz): {adj_mat.nnz}")
-    print("="*60 + "\n")
-    
+    # 8. 归一化邻接矩阵（原有逻辑）
     rowsum = np.array(adj_mat.sum(axis=1))
     with np.errstate(divide='ignore'):
         d_inv_sqrt = np.power(rowsum, -0.5).flatten()
@@ -270,11 +335,21 @@ def load_preprocessed_data(data_dir, device, use_brand=True, debug=False):
     d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
     norm_adj_mat = d_mat_inv_sqrt.dot(adj_mat).dot(d_mat_inv_sqrt).tocoo()
     
+    # 转为PyTorch稀疏张量
     indices = torch.LongTensor(np.vstack((norm_adj_mat.row, norm_adj_mat.col)))
     values = torch.FloatTensor(norm_adj_mat.data)
-    norm_adj_tensor = torch.sparse_coo_tensor(indices, values, torch.Size(norm_adj_mat.shape)).to(device)
-    
-    return train_df, val_df, test_df, num_users, num_items, num_brands, norm_adj_tensor
+    norm_adj_tensor = torch.sparse_coo_tensor(indices, values, torch.Size((num_nodes, num_nodes))).to(device)
+
+    # 9. 打印最终数据概览
+    print(f"\n[Final Data Overview]")
+    print(f"  - Train Interactions: {len(train_df):,}")
+    print(f"  - Val Interactions: {len(val_df):,}")
+    print(f"  - Test Interactions: {len(test_df):,}")
+    print(f"  - Normalized Adj Tensor Device: {norm_adj_tensor.device}")
+    print("="*80 + "\n")
+
+    # 返回值补充统计信息（可选，便于后续分析）
+    return train_df, val_df, test_df, num_users, num_items, num_brands, norm_adj_tensor, item_brand_df#, graph_stats
 
 class BPRDataset(Dataset):
     def __init__(self, df, num_items):
@@ -301,7 +376,7 @@ def bpr_loss_reg(final_user_emb, final_pos_item_emb, final_neg_item_emb,
                              initial_neg_item_emb.norm(2).pow(2)) / float(len(final_user_emb))
     return bpr_loss + reg_loss
 
-def evaluate(model, val_or_test_data, train_data, norm_adj_tensor, k, device, batch_size=1024):
+def evaluate(model, val_or_test_data, train_data, norm_adj_tensor, k, device, batch_size=1024, use_brand=True, item_brand_df=None):
     model.eval()
     test_user_items = dict(zip(val_or_test_data['user_idx'], val_or_test_data['item_idx']))
     train_user_items = train_data.groupby('user_idx')['item_idx'].apply(list).to_dict()
@@ -309,15 +384,31 @@ def evaluate(model, val_or_test_data, train_data, norm_adj_tensor, k, device, ba
     recalls, ndcgs = [], []
 
     with torch.no_grad():
-        # GNN传播在评估开始时只进行一次
-        # FIX: Use the explicitly passed norm_adj_tensor
-        all_user_emb, all_item_emb, _, _ = model(norm_adj_tensor)
+        # 【修改】接收 final_brand_emb
+        all_user_emb, all_item_emb, final_brand_emb, _, _ = model(norm_adj_tensor, use_brand=use_brand)
         
+        # 仅在use_brand=True时构建商品-品牌嵌入映射
+        if use_brand and final_brand_emb is not None and item_brand_df is not None:
+            # 构建商品→品牌的映射张量（确保和模型同设备）
+            item_brand_map = torch.LongTensor(item_brand_df['brand_idx'].values).to(device)
+            # 每个商品对应的品牌嵌入
+            item_brand_emb = final_brand_emb[item_brand_map]
+        else:
+            item_brand_emb = None
+
         for i in tqdm(range(0, len(test_users), batch_size), desc="Evaluating"):
             batch_users = test_users[i: i + batch_size]
             batch_users_tensor = torch.LongTensor(batch_users).to(device)
             
+            # 基础评分：用户-商品匹配
             batch_scores = torch.matmul(all_user_emb[batch_users_tensor], all_item_emb.T)
+            
+            # 【核心】融合品牌偏好评分
+            if use_brand and item_brand_emb is not None:
+                # 计算用户对每个商品品牌的偏好分数
+                brand_scores = torch.matmul(all_user_emb[batch_users_tensor], item_brand_emb.T)
+                # 加权融合（权重可调，建议0.1-0.3）
+                batch_scores = batch_scores + 0.2 * brand_scores
             
             for j, user_idx in enumerate(batch_users):
                 if user_idx in train_user_items:
@@ -343,7 +434,7 @@ def train(config, model_class, model_name, use_brand):
     logger = Logger(config.results_dir, f"{model_name}_{'brand' if use_brand else 'no_brand'}")
     
     # 加载所有数据，包括用于最终测试过滤的全量训练数据
-    train_df, val_df, test_df, num_users, num_items, num_brands, norm_adj_tensor = \
+    train_df, val_df, test_df, num_users, num_items, num_brands, norm_adj_tensor, item_brand_df = \
         load_preprocessed_data(config.processed_data_dir, config.device, use_brand=use_brand, debug=config.debug)
     
     train_loader = DataLoader(BPRDataset(train_df, num_items), 
@@ -373,7 +464,7 @@ def train(config, model_class, model_name, use_brand):
             users, pos_items, neg_items = users.to(config.device), pos_items.to(config.device), neg_items.to(config.device)
             optimizer.zero_grad()
             
-            final_user_emb_all, final_item_emb_all, initial_user_emb_all, initial_item_emb_all = model(norm_adj_tensor)
+            final_user_emb_all, final_item_emb_all, initial_user_emb_all, initial_item_emb_all = model(norm_adj_tensor, use_brand=use_brand)
             final_user_emb, final_pos_item_emb, final_neg_item_emb = final_user_emb_all[users], final_item_emb_all[pos_items], final_item_emb_all[neg_items]
             initial_user_emb, initial_pos_item_emb, initial_neg_item_emb = initial_user_emb_all[users], initial_item_emb_all[pos_items], initial_item_emb_all[neg_items]
 
@@ -393,7 +484,11 @@ def train(config, model_class, model_name, use_brand):
         if epoch % config.val_interval == 0:
             print("Evaluating on VALIDATION set...")
             # FIX: Explicitly pass norm_adj_tensor to the evaluate function
-            recall, ndcg = evaluate(model, val_df, train_df, norm_adj_tensor, config.top_k, config.device)
+            recall, ndcg = evaluate(
+                model, val_df, train_df, norm_adj_tensor, 
+                config.top_k, config.device, 
+                use_brand=use_brand, item_brand_df=item_brand_df  # 新增参数
+            )
             print(f"Epoch {epoch} | Val Recall@{config.top_k}: {recall:.4f}, Val NDCG@{config.top_k}: {ndcg:.4f}")
             logger.log_epoch_metrics(epoch=epoch, avg_loss=avg_loss, recall=recall, ndcg=ndcg)
 
@@ -411,8 +506,8 @@ def test(config, model_class, model_path, use_brand):
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model checkpoint not found at '{model_path}'")
     
-    # 加载所有数据集
-    train_df, val_df, test_df, num_users, num_items, num_brands, norm_adj_tensor = \
+    # 【修改】加载数据时接收 item_brand_df
+    train_df, val_df, test_df, num_users, num_items, num_brands, norm_adj_tensor, item_brand_df = \
         load_preprocessed_data(config.processed_data_dir, config.device, use_brand=use_brand, debug=config.debug)
         
     model = model_class(num_users, num_items, num_brands, config).to(config.device)
@@ -423,8 +518,12 @@ def test(config, model_class, model_path, use_brand):
     # 在测试时，过滤集是 train_df + val_df
     full_train_df_for_filter = pd.concat([train_df, val_df])
     
-    # FIX: Explicitly pass norm_adj_tensor to the evaluate function
-    recall, ndcg = evaluate(model, test_df, full_train_df_for_filter, norm_adj_tensor, config.top_k, config.device)
+    # 【修改】调用evaluate时传入 use_brand 和 item_brand_df
+    recall, ndcg = evaluate(
+        model, test_df, full_train_df_for_filter, norm_adj_tensor, 
+        config.top_k, config.device, 
+        use_brand=use_brand, item_brand_df=item_brand_df  # 新增参数
+    )
     
     print("\n--- Final Test Results ---")
     print(f"Recall@{config.top_k}: {recall:.4f}")
