@@ -244,6 +244,9 @@ def load_preprocessed_data(data_dir, device, use_brand=True, debug=False):
     print(f"DEBUG: expected_edges = {expected_edges}")
     print(f"DEBUG: all_rows.shape[0] = {all_rows.shape[0]}")
     print(f"DEBUG: all_data.shape[0] = {all_data.shape[0]}")
+    brand_item_count = item_brand_df['brand_idx'].value_counts()
+    print(f"品牌覆盖商品数的中位数：{brand_item_count.median()}")
+    print(f"品牌覆盖商品数的最大值/最小值：{brand_item_count.max()}/{brand_item_count.min()}")
     
     # 强制断言，如果长度不匹配，程序会在这里崩溃
     assert all_rows.shape[0] == expected_edges, "Error: Mismatch in row coordinates count!"
@@ -435,7 +438,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run GNN-based recommendation models.")
     parser.add_argument('mode', choices=['train', 'test'], help="Mode: 'train' or 'test'")
     parser.add_argument('--model_name', type=str, default='LightGCN', help="The name of the model class.")
-    parser.add_argument('--core', type=int, default=10, help="K-core filtering threshold for data.")
+    parser.add_argument('--core', type=int, default=20, help="K-core filtering threshold for data.")
     parser.add_argument('--epochs', type=int, default=100, help="Number of training epochs.")
     parser.add_argument('--model_path', type=str, help="Path to checkpoint for testing.")
     parser.add_argument('--no_brand', action='store_true', help="Run ablation study without brand info.")
