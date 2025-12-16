@@ -375,7 +375,7 @@ def bpr_loss_reg(final_user_emb, final_pos_item_emb, final_neg_item_emb,
     reg_loss = lambda_reg * (initial_user_emb.norm(2).pow(2) + initial_pos_item_emb.norm(2).pow(2) +
                              initial_neg_item_emb.norm(2).pow(2)) / float(len(final_user_emb))
     return bpr_loss + reg_loss
-
+#'''
 def evaluate(model, val_or_test_data, train_data, norm_adj_tensor, k, device, batch_size=1024, use_brand=True, item_brand_df=None):
     model.eval()
     test_user_items = dict(zip(val_or_test_data['user_idx'], val_or_test_data['item_idx']))
@@ -428,7 +428,44 @@ def evaluate(model, val_or_test_data, train_data, norm_adj_tensor, k, device, ba
                 else:
                     ndcgs.append(0)
     return np.mean(recalls), np.mean(ndcgs)
+'''
+def evaluate(model, val_or_test_data, train_data, norm_adj_tensor, k, device, batch_size=1024, use_brand=True, item_brand_df=None):
+    model.eval()
+    test_user_items = dict(zip(val_or_test_data['user_idx'], val_or_test_data['item_idx']))
+    train_user_items = train_data.groupby('user_idx')['item_idx'].apply(list).to_dict()
+    test_users = list(test_user_items.keys())
+    recalls, ndcgs = [], []
 
+    with torch.no_grad():
+        # GNN传播在评估开始时只进行一次
+        all_user_emb, all_item_emb, _, _, _ = model(norm_adj_tensor)
+        
+        for i in tqdm(range(0, len(test_users), batch_size), desc="Evaluating"):
+            batch_users = test_users[i: i + batch_size]
+            batch_users_tensor = torch.LongTensor(batch_users).to(device)
+            
+            # 评分计算
+            batch_scores = torch.matmul(all_user_emb[batch_users_tensor], all_item_emb.T)
+
+            for j, user_idx in enumerate(batch_users):
+                if user_idx in train_user_items:
+                    batch_scores[j, train_user_items[user_idx]] = -1e10
+            
+            _, top_k_indices = torch.topk(batch_scores, k=k)
+            top_k_indices_cpu = top_k_indices.cpu().numpy()
+            batch_true_items = [test_user_items[user] for user in batch_users]
+
+            for j in range(len(batch_users)):
+                pred_items, true_item = top_k_indices_cpu[j], batch_true_items[j]
+                hit = true_item in pred_items
+                recalls.append(1 if hit else 0)
+                if hit:
+                    position = np.where(pred_items == true_item)[0][0]
+                    ndcgs.append(1 / np.log2(position + 2))
+                else:
+                    ndcgs.append(0)
+    return np.mean(recalls), np.mean(ndcgs)
+#'''
 # --- train (MODIFIED for Debug Mode) ---
 def train(config, model_class, model_name, use_brand):
     logger = Logger(config.results_dir, f"{model_name}_{'brand' if use_brand else 'no_brand'}")
@@ -464,7 +501,7 @@ def train(config, model_class, model_name, use_brand):
             users, pos_items, neg_items = users.to(config.device), pos_items.to(config.device), neg_items.to(config.device)
             optimizer.zero_grad()
             
-            final_user_emb_all, final_item_emb_all, initial_user_emb_all, initial_item_emb_all = model(norm_adj_tensor, use_brand=use_brand)
+            final_user_emb_all, final_item_emb_all, final_brand_emb_all, initial_user_emb_all, initial_item_emb_all = model(norm_adj_tensor, use_brand=use_brand)
             final_user_emb, final_pos_item_emb, final_neg_item_emb = final_user_emb_all[users], final_item_emb_all[pos_items], final_item_emb_all[neg_items]
             initial_user_emb, initial_pos_item_emb, initial_neg_item_emb = initial_user_emb_all[users], initial_item_emb_all[pos_items], initial_item_emb_all[neg_items]
 
@@ -538,7 +575,7 @@ if __name__ == '__main__':
     parser.add_argument('mode', choices=['train', 'test'], help="Mode: 'train' or 'test'")
     parser.add_argument('--model_name', type=str, default='LightGCN', help="The name of the model class.")
     parser.add_argument('--core', type=int, default=20, help="K-core filtering threshold for data.")
-    parser.add_argument('--epochs', type=int, default=100, help="Number of training epochs.")
+    parser.add_argument('--epochs', type=int, default=150, help="Number of training epochs.")
     parser.add_argument('--model_path', type=str, help="Path to checkpoint for testing.")
     parser.add_argument('--no_brand', action='store_true', help="Run ablation study without brand info.")
     # --num_gpus 参数不再需要，可以移除
