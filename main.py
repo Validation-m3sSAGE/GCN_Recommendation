@@ -289,7 +289,6 @@ def load_preprocessed_data(data_dir, device, use_brand=True, debug=False):
     
     # 确定节点总数
     num_nodes = num_users + num_items + num_brands  # 无论use_brand是否为True
-    # 移除原有分支：if use_brand: num_nodes = ... else: num_nodes = ...
 
     # 提取用户-物品边（不变）
     user_indices = train_df['user_idx'].values
@@ -366,7 +365,47 @@ class BPRDataset(Dataset):
             if neg_item not in self.user_pos_items.get(user, set()):
                 break
         return user, pos_item, neg_item
-
+#'''
+#NEW
+def bpr_loss_reg(
+    final_user_emb, final_pos_item_emb, final_neg_item_emb,
+    initial_user_emb, initial_pos_item_emb, initial_neg_item_emb,
+    lambda_reg,
+    brand_loss=False,  # 是否开启Author损失
+    final_brand_emb=None,  # Author嵌入
+    pos_item_brand_idx=None,  # 正商品Author索引
+    neg_item_brand_idx=None,  # 负商品Author索引
+    brand_loss_weight=0.1  # Author损失权重
+):
+    # 基础BPR损失（原有逻辑不变）
+    pos_scores = torch.sum(final_user_emb * final_pos_item_emb, dim=1)
+    neg_scores = torch.sum(final_user_emb * final_neg_item_emb, dim=1)
+    bpr_loss = -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores) + 1e-8))
+    
+    # Author偏好损失（新增）
+    brand_loss_val = 0.0
+    if brand_loss and final_brand_emb is not None:
+        # 提取正负商品的Author嵌入
+        pos_brand_emb = final_brand_emb[pos_item_brand_idx]
+        neg_brand_emb = final_brand_emb[neg_item_brand_idx]
+        # 计算用户对正负Author的偏好分数
+        brand_pos_score = torch.sum(final_user_emb * pos_brand_emb, dim=1)
+        brand_neg_score = torch.sum(final_user_emb * neg_brand_emb, dim=1)
+        # BPR形式的Author损失
+        brand_loss_val = -torch.mean(torch.log(torch.sigmoid(brand_pos_score - brand_neg_score) + 1e-8))
+    
+    # 正则损失（原有逻辑不变）
+    reg_loss = lambda_reg * (
+        initial_user_emb.norm(2).pow(2) + 
+        initial_pos_item_emb.norm(2).pow(2) + 
+        initial_neg_item_emb.norm(2).pow(2)
+    ) / float(len(final_user_emb))
+    
+    # 总损失 = 基础BPR + 低权重Author损失 + 正则
+    total_loss = bpr_loss + brand_loss_weight * brand_loss_val + reg_loss
+    return total_loss
+'''
+#OLD
 def bpr_loss_reg(final_user_emb, final_pos_item_emb, final_neg_item_emb,
                  initial_user_emb, initial_pos_item_emb, initial_neg_item_emb, lambda_reg):
     pos_scores = torch.sum(final_user_emb * final_pos_item_emb, dim=1)
@@ -376,6 +415,9 @@ def bpr_loss_reg(final_user_emb, final_pos_item_emb, final_neg_item_emb,
                              initial_neg_item_emb.norm(2).pow(2)) / float(len(final_user_emb))
     return bpr_loss + reg_loss
 #'''
+
+'''
+#NEW
 def evaluate(model, val_or_test_data, train_data, norm_adj_tensor, k, device, batch_size=1024, use_brand=True, item_brand_df=None):
     model.eval()
     test_user_items = dict(zip(val_or_test_data['user_idx'], val_or_test_data['item_idx']))
@@ -429,6 +471,7 @@ def evaluate(model, val_or_test_data, train_data, norm_adj_tensor, k, device, ba
                     ndcgs.append(0)
     return np.mean(recalls), np.mean(ndcgs)
 '''
+#OLD
 def evaluate(model, val_or_test_data, train_data, norm_adj_tensor, k, device, batch_size=1024, use_brand=True, item_brand_df=None):
     model.eval()
     test_user_items = dict(zip(val_or_test_data['user_idx'], val_or_test_data['item_idx']))
@@ -467,6 +510,117 @@ def evaluate(model, val_or_test_data, train_data, norm_adj_tensor, k, device, ba
     return np.mean(recalls), np.mean(ndcgs)
 #'''
 # --- train (MODIFIED for Debug Mode) ---
+#'''
+def train(config, model_class, model_name, use_brand, brand_loss=False, brand_loss_weight=0.1):
+    logger = Logger(config.results_dir, f"{model_name}_{'brand' if use_brand else 'no_brand'}")
+    
+    # 加载所有数据，包括用于最终测试过滤的全量训练数据
+    train_df, val_df, test_df, num_users, num_items, num_brands, norm_adj_tensor, item_brand_df = \
+        load_preprocessed_data(config.processed_data_dir, config.device, use_brand=use_brand, debug=config.debug)
+    
+    # ========== 新增：预构建「物品idx → Author/brand idx」映射（关键） ==========
+    # 用defaultdict兜底，避免物品无Author时报KeyError
+    from collections import defaultdict
+    item_to_brand = defaultdict(lambda: 0)
+    if use_brand and not item_brand_df.empty:
+        # 从item_brand_df中提取映射
+        item_brand_pairs = item_brand_df[['item_idx', 'brand_idx']].values
+        for item_idx, brand_idx in item_brand_pairs:
+            item_to_brand[int(item_idx)] = int(brand_idx)
+    # ==========================================================================
+    
+    train_loader = DataLoader(BPRDataset(train_df, num_items), 
+                              batch_size=config.batch_size, shuffle=True, 
+                              num_workers=config.num_workers, pin_memory=True)
+                              
+    model = model_class(num_users, num_items, num_brands, config).to(config.device)
+    optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
+    
+    best_recall = 0.0
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
+        
+    print("\nStep 2: Starting model training...")
+    # 新增：打印Author损失配置，确认开关生效
+    if use_brand:
+        print(f"Author Loss Config: brand_loss={brand_loss}, weight={brand_loss_weight}")
+    
+    for epoch in range(1, config.epochs + 1):
+        model.train()
+        epoch_losses = []
+        
+        # 在调试模式下，每个epoch只运行几个batch
+        max_batches_per_epoch = 10 if config.debug else len(train_loader)
+        
+        progress_bar = tqdm(train_loader, total=max_batches_per_epoch, desc=f"Epoch {epoch}/{config.epochs}")
+        
+        for i, (users, pos_items, neg_items) in enumerate(progress_bar):
+            if i >= max_batches_per_epoch:
+                break # 提前结束 epoch
+                
+            users, pos_items, neg_items = users.to(config.device), pos_items.to(config.device), neg_items.to(config.device)
+            optimizer.zero_grad()
+            
+            final_user_emb_all, final_item_emb_all, final_brand_emb_all, initial_user_emb_all, initial_item_emb_all = model(norm_adj_tensor, use_brand=use_brand)
+            final_user_emb, final_pos_item_emb, final_neg_item_emb = final_user_emb_all[users], final_item_emb_all[pos_items], final_item_emb_all[neg_items]
+            initial_user_emb, initial_pos_item_emb, initial_neg_item_emb = initial_user_emb_all[users], initial_item_emb_all[pos_items], initial_item_emb_all[neg_items]
+
+            # ========== 新增：获取正负商品的Author/brand idx ==========
+            pos_item_brand_idx = None
+            neg_item_brand_idx = None
+            if use_brand and brand_loss:
+                # 从预构建映射中查询，转到设备
+                pos_item_brand_idx = torch.tensor(
+                    [item_to_brand[int(item)] for item in pos_items.cpu().numpy()],
+                    device=config.device
+                )
+                neg_item_brand_idx = torch.tensor(
+                    [item_to_brand[int(item)] for item in neg_items.cpu().numpy()],
+                    device=config.device
+                )
+            # ==========================================================
+
+            # ========== 修改：调用带Author损失的bpr_loss_reg ==========
+            loss = bpr_loss_reg(final_user_emb, final_pos_item_emb, final_neg_item_emb,
+                initial_user_emb, initial_pos_item_emb, initial_neg_item_emb, config.weight_decay,
+                brand_loss=brand_loss,  # 传递Author损失开关
+                final_brand_emb=final_brand_emb_all if use_brand else None,  # Author嵌入
+                pos_item_brand_idx=pos_item_brand_idx,  # 正商品Author索引
+                neg_item_brand_idx=neg_item_brand_idx,  # 负商品Author索引
+                brand_loss_weight=brand_loss_weight  # Author损失权重
+            )
+            # ==========================================================
+
+            loss.backward()
+            optimizer.step()
+            
+            batch_loss = loss.item()
+            epoch_losses.append(batch_loss)
+            logger.log_batch_loss(batch_loss)
+            progress_bar.set_postfix(loss=f"{batch_loss:.4f}")
+
+        avg_loss = np.mean(epoch_losses) if epoch_losses else 0
+        print(f"Epoch {epoch}/{config.epochs}, Average Loss: {avg_loss:.4f}")
+        
+        if epoch % config.val_interval == 0:
+            print("Evaluating on VALIDATION set...")
+            # FIX: Explicitly pass norm_adj_tensor to the evaluate function
+            recall, ndcg = evaluate(
+                model, val_df, train_df, norm_adj_tensor, 
+                config.top_k, config.device, 
+                use_brand=use_brand, item_brand_df=item_brand_df  # 新增参数
+            )
+            print(f"Epoch {epoch} | Val Recall@{config.top_k}: {recall:.4f}, Val NDCG@{config.top_k}: {ndcg:.4f}")
+            logger.log_epoch_metrics(epoch=epoch, avg_loss=avg_loss, recall=recall, ndcg=ndcg)
+
+            if recall > best_recall:
+                best_recall = recall
+                save_path = os.path.join(config.checkpoint_dir, config.best_model_name)
+                torch.save(model.state_dict(), save_path)
+                print(f"New best model saved...")
+
+    print("Training finished.")
+    logger.save(total_epochs=config.epochs)
+'''
 def train(config, model_class, model_name, use_brand):
     logger = Logger(config.results_dir, f"{model_name}_{'brand' if use_brand else 'no_brand'}")
     
@@ -537,6 +691,7 @@ def train(config, model_class, model_name, use_brand):
 
     print("Training finished.")
     logger.save(total_epochs=config.epochs)
+#'''
 
 def test(config, model_class, model_path, use_brand):
     print("--- Starting Testing Mode ---")
@@ -578,7 +733,7 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=150, help="Number of training epochs.")
     parser.add_argument('--model_path', type=str, help="Path to checkpoint for testing.")
     parser.add_argument('--no_brand', action='store_true', help="Run ablation study without brand info.")
-    # --num_gpus 参数不再需要，可以移除
+    parser.add_argument('--brand_loss', action='store_true', help='enable author preference loss')
     parser.add_argument('--debug', action='store_true', help="Enable debug mode for a quick run.")
     
     args = parser.parse_args()
@@ -593,7 +748,7 @@ if __name__ == '__main__':
     config.best_model_name = f'best_{args.model_name.lower()}_core{args.core}{ablation_suffix}.pth'
 
     if args.mode == 'train':
-        train(config, ModelClass, args.model_name, use_brand=not args.no_brand) 
+        train(config, ModelClass, args.model_name, use_brand=not args.no_brand, brand_loss=args.brand_loss) 
     elif args.mode == 'test':
         model_to_test = args.model_path if args.model_path else os.path.join(config.checkpoint_dir, config.best_model_name)
         test(config, ModelClass, model_to_test, use_brand=not args.no_brand)
