@@ -1,7 +1,9 @@
-dataset/
+raw_data
+processed_data*
 script/
 checkpoint*/
 *.jsonl
 __pycache__
 *_epoch_*
 old/
+debug/

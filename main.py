@@ -55,7 +55,7 @@ class Config:
         self.debug = args.debug
         core = args.core
         
-        self.processed_data_dir = f'dataset/amazon_books/processed_data_{core}'
+        self.processed_data_dir = f'dataset/amazon_books_emb/processed_data_{core}'
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
         
@@ -511,6 +511,7 @@ def evaluate(model, val_or_test_data, train_data, norm_adj_tensor, k, device, ba
 #'''
 # --- train (MODIFIED for Debug Mode) ---
 #'''
+#NEW
 def train(config, model_class, model_name, use_brand, brand_loss=False, brand_loss_weight=0.1):
     logger = Logger(config.results_dir, f"{model_name}_{'brand' if use_brand else 'no_brand'}")
     
@@ -621,6 +622,7 @@ def train(config, model_class, model_name, use_brand, brand_loss=False, brand_lo
     print("Training finished.")
     logger.save(total_epochs=config.epochs)
 '''
+#OLD
 def train(config, model_class, model_name, use_brand):
     logger = Logger(config.results_dir, f"{model_name}_{'brand' if use_brand else 'no_brand'}")
     
