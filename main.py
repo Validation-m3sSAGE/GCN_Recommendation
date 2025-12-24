@@ -71,6 +71,7 @@ class Config:
         self.checkpoint_dir = 'exp/checkpoints/checkpoints'
         self.results_dir = 'exp/results/results'
         self.best_model_name = 'best_model.pth'
+        self.pretrained_emb_path = os.path.join(self.processed_data_dir, 'item_embeddings.npy')
 
         if self.debug:
             print("--- RUNNING IN DEBUG MODE ---")
@@ -171,11 +172,6 @@ class Logger:
 def load_preprocessed_data(data_dir, device, use_brand=True, debug=False):
     """
     加载预处理数据，并补充异构图核心统计信息
-    :param data_dir: 数据目录
-    :param device: 设备（cuda/cpu）
-    :param use_brand: 是否使用品牌节点
-    :param debug: 是否调试模式（小样本）
-    :return: 训练/验证/测试集 + 节点数 + 归一化邻接矩阵 + 物品-品牌df + 统计信息dict
     """
     print("="*80)
     print("Step 1: Loading and preparing data (with graph structure stats)")
@@ -404,74 +400,7 @@ def bpr_loss_reg(
     # 总损失 = 基础BPR + 低权重Author损失 + 正则
     total_loss = bpr_loss + brand_loss_weight * brand_loss_val + reg_loss
     return total_loss
-'''
-#OLD
-def bpr_loss_reg(final_user_emb, final_pos_item_emb, final_neg_item_emb,
-                 initial_user_emb, initial_pos_item_emb, initial_neg_item_emb, lambda_reg):
-    pos_scores = torch.sum(final_user_emb * final_pos_item_emb, dim=1)
-    neg_scores = torch.sum(final_user_emb * final_neg_item_emb, dim=1)
-    bpr_loss = -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores) + 1e-8))
-    reg_loss = lambda_reg * (initial_user_emb.norm(2).pow(2) + initial_pos_item_emb.norm(2).pow(2) +
-                             initial_neg_item_emb.norm(2).pow(2)) / float(len(final_user_emb))
-    return bpr_loss + reg_loss
-#'''
 
-'''
-#NEW
-def evaluate(model, val_or_test_data, train_data, norm_adj_tensor, k, device, batch_size=1024, use_brand=True, item_brand_df=None):
-    model.eval()
-    test_user_items = dict(zip(val_or_test_data['user_idx'], val_or_test_data['item_idx']))
-    train_user_items = train_data.groupby('user_idx')['item_idx'].apply(list).to_dict()
-    test_users = list(test_user_items.keys())
-    recalls, ndcgs = [], []
-
-    with torch.no_grad():
-        # 【修改】接收 final_brand_emb
-        all_user_emb, all_item_emb, final_brand_emb, _, _ = model(norm_adj_tensor, use_brand=use_brand)
-        
-        # 仅在use_brand=True时构建商品-品牌嵌入映射
-        if use_brand and final_brand_emb is not None and item_brand_df is not None:
-            # 构建商品→品牌的映射张量（确保和模型同设备）
-            item_brand_map = torch.LongTensor(item_brand_df['brand_idx'].values).to(device)
-            # 每个商品对应的品牌嵌入
-            item_brand_emb = final_brand_emb[item_brand_map]
-        else:
-            item_brand_emb = None
-
-        for i in tqdm(range(0, len(test_users), batch_size), desc="Evaluating"):
-            batch_users = test_users[i: i + batch_size]
-            batch_users_tensor = torch.LongTensor(batch_users).to(device)
-            
-            # 基础评分：用户-商品匹配
-            batch_scores = torch.matmul(all_user_emb[batch_users_tensor], all_item_emb.T)
-            
-            # 【核心】融合品牌偏好评分
-            if use_brand and item_brand_emb is not None:
-                # 计算用户对每个商品品牌的偏好分数
-                brand_scores = torch.matmul(all_user_emb[batch_users_tensor], item_brand_emb.T)
-                # 加权融合（权重可调，建议0.1-0.3）
-                batch_scores = batch_scores + 0.2 * brand_scores
-            
-            for j, user_idx in enumerate(batch_users):
-                if user_idx in train_user_items:
-                    batch_scores[j, train_user_items[user_idx]] = -1e10
-            
-            _, top_k_indices = torch.topk(batch_scores, k=k)
-            top_k_indices_cpu = top_k_indices.cpu().numpy()
-            batch_true_items = [test_user_items[user] for user in batch_users]
-
-            for j in range(len(batch_users)):
-                pred_items, true_item = top_k_indices_cpu[j], batch_true_items[j]
-                hit = true_item in pred_items
-                recalls.append(1 if hit else 0)
-                if hit:
-                    position = np.where(pred_items == true_item)[0][0]
-                    ndcgs.append(1 / np.log2(position + 2))
-                else:
-                    ndcgs.append(0)
-    return np.mean(recalls), np.mean(ndcgs)
-'''
-#OLD
 def evaluate(model, val_or_test_data, train_data, norm_adj_tensor, k, device, batch_size=1024, use_brand=True, item_brand_df=None):
     model.eval()
     test_user_items = dict(zip(val_or_test_data['user_idx'], val_or_test_data['item_idx']))
@@ -508,33 +437,35 @@ def evaluate(model, val_or_test_data, train_data, norm_adj_tensor, k, device, ba
                 else:
                     ndcgs.append(0)
     return np.mean(recalls), np.mean(ndcgs)
-#'''
+
 # --- train (MODIFIED for Debug Mode) ---
-#'''
-#NEW
-def train(config, model_class, model_name, use_brand, brand_loss=False, brand_loss_weight=0.1):
-    logger = Logger(config.results_dir, f"{model_name}_{'brand' if use_brand else 'no_brand'}")
+
+def train(config, model_class, model_name, use_brand, brand_loss=False, brand_loss_weight=0.1, use_pretrained_emb=True):
+    logger_name = f"{model_name}_{'brand' if use_brand else 'no_brand'}"
+    if use_pretrained_emb:
+        logger_name += "_pretrained"
+    logger = Logger(config.results_dir, logger_name)
     
-    # 加载所有数据，包括用于最终测试过滤的全量训练数据
+    # --- CORE MODIFICATION: Load pretrained embeddings ---
+    pretrained_item_emb = None
+    if use_pretrained_emb:
+        if os.path.exists(config.pretrained_emb_path):
+            print(f"Loading pretrained item embeddings from {config.pretrained_emb_path}")
+            pretrained_item_emb = np.load(config.pretrained_emb_path)
+        else:
+            print(f"WARNING: --use_pretrained_emb was set, but file not found at {config.pretrained_emb_path}. Using random initialization.")
+    # --- END MODIFICATION ---
+
     train_df, val_df, test_df, num_users, num_items, num_brands, norm_adj_tensor, item_brand_df = \
         load_preprocessed_data(config.processed_data_dir, config.device, use_brand=use_brand, debug=config.debug)
-    
-    # ========== 新增：预构建「物品idx → Author/brand idx」映射（关键） ==========
-    # 用defaultdict兜底，避免物品无Author时报KeyError
-    from collections import defaultdict
-    item_to_brand = defaultdict(lambda: 0)
-    if use_brand and not item_brand_df.empty:
-        # 从item_brand_df中提取映射
-        item_brand_pairs = item_brand_df[['item_idx', 'brand_idx']].values
-        for item_idx, brand_idx in item_brand_pairs:
-            item_to_brand[int(item_idx)] = int(brand_idx)
-    # ==========================================================================
     
     train_loader = DataLoader(BPRDataset(train_df, num_items), 
                               batch_size=config.batch_size, shuffle=True, 
                               num_workers=config.num_workers, pin_memory=True)
                               
-    model = model_class(num_users, num_items, num_brands, config).to(config.device)
+    # MODIFIED: Pass pretrained embeddings to model constructor
+    model = model_class(num_users, num_items, num_brands, config, pretrained_item_emb=pretrained_item_emb).to(config.device)
+    
     optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
     
     best_recall = 0.0
@@ -621,90 +552,22 @@ def train(config, model_class, model_name, use_brand, brand_loss=False, brand_lo
 
     print("Training finished.")
     logger.save(total_epochs=config.epochs)
-'''
-#OLD
-def train(config, model_class, model_name, use_brand):
-    logger = Logger(config.results_dir, f"{model_name}_{'brand' if use_brand else 'no_brand'}")
-    
-    # 加载所有数据，包括用于最终测试过滤的全量训练数据
-    train_df, val_df, test_df, num_users, num_items, num_brands, norm_adj_tensor, item_brand_df = \
-        load_preprocessed_data(config.processed_data_dir, config.device, use_brand=use_brand, debug=config.debug)
-    
-    train_loader = DataLoader(BPRDataset(train_df, num_items), 
-                              batch_size=config.batch_size, shuffle=True, 
-                              num_workers=config.num_workers, pin_memory=True)
-                              
-    model = model_class(num_users, num_items, num_brands, config).to(config.device)
-    optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
-    
-    best_recall = 0.0
-    os.makedirs(config.checkpoint_dir, exist_ok=True)
-        
-    print("\nStep 2: Starting model training...")
-    for epoch in range(1, config.epochs + 1):
-        model.train()
-        epoch_losses = []
-        
-        # 在调试模式下，每个epoch只运行几个batch
-        max_batches_per_epoch = 10 if config.debug else len(train_loader)
-        
-        progress_bar = tqdm(train_loader, total=max_batches_per_epoch, desc=f"Epoch {epoch}/{config.epochs}")
-        
-        for i, (users, pos_items, neg_items) in enumerate(progress_bar):
-            if i >= max_batches_per_epoch:
-                break # 提前结束 epoch
-                
-            users, pos_items, neg_items = users.to(config.device), pos_items.to(config.device), neg_items.to(config.device)
-            optimizer.zero_grad()
-            
-            final_user_emb_all, final_item_emb_all, final_brand_emb_all, initial_user_emb_all, initial_item_emb_all = model(norm_adj_tensor, use_brand=use_brand)
-            final_user_emb, final_pos_item_emb, final_neg_item_emb = final_user_emb_all[users], final_item_emb_all[pos_items], final_item_emb_all[neg_items]
-            initial_user_emb, initial_pos_item_emb, initial_neg_item_emb = initial_user_emb_all[users], initial_item_emb_all[pos_items], initial_item_emb_all[neg_items]
 
-            loss = bpr_loss_reg(final_user_emb, final_pos_item_emb, final_neg_item_emb,
-                                initial_user_emb, initial_pos_item_emb, initial_neg_item_emb, config.weight_decay)
-            loss.backward()
-            optimizer.step()
-            
-            batch_loss = loss.item()
-            epoch_losses.append(batch_loss)
-            logger.log_batch_loss(batch_loss)
-            progress_bar.set_postfix(loss=f"{batch_loss:.4f}")
-
-        avg_loss = np.mean(epoch_losses) if epoch_losses else 0
-        print(f"Epoch {epoch}/{config.epochs}, Average Loss: {avg_loss:.4f}")
-        
-        if epoch % config.val_interval == 0:
-            print("Evaluating on VALIDATION set...")
-            # FIX: Explicitly pass norm_adj_tensor to the evaluate function
-            recall, ndcg = evaluate(
-                model, val_df, train_df, norm_adj_tensor, 
-                config.top_k, config.device, 
-                use_brand=use_brand, item_brand_df=item_brand_df  # 新增参数
-            )
-            print(f"Epoch {epoch} | Val Recall@{config.top_k}: {recall:.4f}, Val NDCG@{config.top_k}: {ndcg:.4f}")
-            logger.log_epoch_metrics(epoch=epoch, avg_loss=avg_loss, recall=recall, ndcg=ndcg)
-
-            if recall > best_recall:
-                best_recall = recall
-                save_path = os.path.join(config.checkpoint_dir, config.best_model_name)
-                torch.save(model.state_dict(), save_path)
-                print(f"New best model saved...")
-
-    print("Training finished.")
-    logger.save(total_epochs=config.epochs)
-#'''
-
-def test(config, model_class, model_path, use_brand):
+def test(config, model_class, model_path, use_brand, use_pretrained_emb):
     print("--- Starting Testing Mode ---")
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model checkpoint not found at '{model_path}'")
-    
-    # 【修改】加载数据时接收 item_brand_df
+    pretrained_item_emb = None
+    if use_pretrained_emb:
+        if os.path.exists(config.pretrained_emb_path):
+            pretrained_item_emb = np.load(config.pretrained_emb_path)
+        else:
+            print(f"WARNING: Pretrained embedding file not found for testing.")
+            
     train_df, val_df, test_df, num_users, num_items, num_brands, norm_adj_tensor, item_brand_df = \
         load_preprocessed_data(config.processed_data_dir, config.device, use_brand=use_brand, debug=config.debug)
         
-    model = model_class(num_users, num_items, num_brands, config).to(config.device)
+    model = model_class(num_users, num_items, num_brands, config, pretrained_item_emb=pretrained_item_emb).to(config.device)
     model.load_state_dict(torch.load(model_path, map_location=config.device))
     print(f"Model loaded from '{model_path}'")
 
@@ -737,20 +600,22 @@ if __name__ == '__main__':
     parser.add_argument('--no_brand', action='store_true', help="Run ablation study without brand info.")
     parser.add_argument('--brand_loss', action='store_true', help='enable author preference loss')
     parser.add_argument('--debug', action='store_true', help="Enable debug mode for a quick run.")
-    
+    parser.add_argument('--use_pretrained_emb', action='store_true', help="Initialize item embeddings with pretrained text embeddings.")
+
     args = parser.parse_args()
 
     random.seed(42); np.random.seed(42); torch.manual_seed(42)
     
-    # Config 初始化现在直接接收 args
     config = Config(args)
     ModelClass = get_model(args.model_name)
     
+    # 动态命名，包含 pretrained 信息
     ablation_suffix = '_no_brand' if args.no_brand else ''
-    config.best_model_name = f'best_{args.model_name.lower()}_core{args.core}{ablation_suffix}.pth'
+    pretrained_suffix = '_embed' if args.use_pretrained_emb else ''
+    config.best_model_name = f'best_{args.model_name.lower()}_core{args.core}{ablation_suffix}{pretrained_suffix}.pth'
 
     if args.mode == 'train':
-        train(config, ModelClass, args.model_name, use_brand=not args.no_brand, brand_loss=args.brand_loss) 
+        train(config, ModelClass, args.model_name, use_brand=not args.no_brand, use_pretrained_emb=args.use_pretrained_emb) 
     elif args.mode == 'test':
         model_to_test = args.model_path if args.model_path else os.path.join(config.checkpoint_dir, config.best_model_name)
-        test(config, ModelClass, model_to_test, use_brand=not args.no_brand)
+        test(config, ModelClass, model_to_test, use_brand=not args.no_brand, use_pretrained_emb=args.use_pretrained_emb)
