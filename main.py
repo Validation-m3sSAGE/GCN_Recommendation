@@ -55,7 +55,7 @@ class Config:
         self.debug = args.debug
         core = args.core
         
-        self.processed_data_dir = f'dataset/amazon_books_emb/processed_data_{core}'
+        self.processed_data_dir = f'dataset/steam_emb/processed_data_{core}'
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
         
@@ -594,7 +594,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run GNN-based recommendation models.")
     parser.add_argument('mode', choices=['train', 'test'], help="Mode: 'train' or 'test'")
     parser.add_argument('--model_name', type=str, default='LightGCN', help="The name of the model class.")
-    parser.add_argument('--core', type=int, default=20, help="K-core filtering threshold for data.")
+    parser.add_argument('--core', type=int, default=16, help="K-core filtering threshold for data.")
     parser.add_argument('--epochs', type=int, default=150, help="Number of training epochs.")
     parser.add_argument('--model_path', type=str, help="Path to checkpoint for testing.")
     parser.add_argument('--no_brand', action='store_true', help="Run ablation study without brand info.")
